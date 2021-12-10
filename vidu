@@ -1,0 +1,358 @@
+#!/bin/python3
+
+"""
+usage:
+    vidu a.mp3 ... plays a.mp3
+    vidu trim in.mp4 out.mp4 2.5 12:37 ... trim from start at 2.5 seconds to end at 12:37 (2nd arg is end, not length)
+    vidu trim in.mp4 out.mp4 2.5 -3.5 ... negative arg is relative to the end of the file
+    vidu loudness a.mp4  ... measure loudness (slow operation for large files)
+    vidu length a.mp4  ... get length in seconds
+    vidu amplify in.mp4 out.mp4      ... normalize volume
+    vidu amplify in.mp4 out.mp4 30 3200      ... raise volume by 30 db, with lowpass filter at 3200 Hz
+    vidu amplify in.mp4 out.mp4 - 3200      ... raise volume to -23 db, with lowpass filter at 3200 Hz
+    vidu demetal in.mp3 out.mp3     ... removes low-freq noise and high-freq metallic sounds that result from low input level; use as last resort
+    vidu extract_audio in.mp4 out.aac  ... sets sampling rate and number of channels; this also works for resampling an mp3 to project's defaults
+    vidu extract_audio in.mp4 out.aac 64 16  ... resample to 16 kHz sampling rate, 64 kbps (a good combo for speech quality, supported by MP3)
+    vidu cat foo*.mp3 out.mp3 ... shell expands any wildcards, giving total of n filenames; first n-1 are inputs, nth is output; output must not exist
+    vidu fix_mp3 foo*.mp3 ... tries to fix missing VBR header and other problems; modifies all files in place
+    vidu speed in.mp3 out.mp3 0.7 ... slows down the audio to 70% of normal speed; values >1 give a speed-up; my record.rb script can also do this
+                                      using an option, which calls vidu
+    vidu pitch in.mp3 out.mp3 2.0 ... similar to speed
+defaults file
+  named .vidu
+  can be in cwd or any parent directory
+  typical contents:
+    {"width":960,"height":720,"fps":15.0,"video_codec":"avc","pixel_format":"yuv","container":"mp4",
+           "audio_codec":"aac","sampling_rate":44100.0,"channels":1}
+
+"""
+
+import subprocess,sys,os,re,os.path,argparse,json
+from pathlib import Path
+
+def main():
+  if len(sys.argv)==2:
+    verb = 'play'
+    file1 = sys.argv[1]
+    dry_run(x=False)
+  else:
+    parser = argparse.ArgumentParser(description='Utility to perform operations on video files.')
+    parser.add_argument('verb', metavar='operation', type=str, nargs=1,help='a verb for the operation to be performed')
+    parser.add_argument('file1', metavar='infile', type=str, nargs=1,help='an input file')
+    parser.add_argument('more_args', metavar='arg', type=str, nargs='*',help='additional arguments')
+    parser.add_argument('-d','--dry-run', dest='dry_run', action='store_true',default=False,
+                    help="dry run, don't actually execute the commend")
+    args = parser.parse_args() # returns a Namespace object, https://docs.python.org/3/library/argparse.html#argparse.Namespace
+    a = vars(args)
+    verb = a['verb'][0]
+    file1 = a['file1'][0]
+    dry_run(x=a['dry_run'])
+
+  defaults = get_defaults()
+  print(f'defaults: {defaults}')
+
+  recognized = False
+
+  if verb=='play':
+    recognized = True
+    input_file_required(file1)
+    do_play(file1)
+  if verb=='loudness':
+    recognized = True
+    input_file_required(file1)
+    do_loudness(file1)
+  if verb=='length':
+    recognized = True
+    input_file_required(file1)
+    do_length(file1)
+  if verb=='trim':
+    recognized = True
+    input_file_required(file1)
+    outfile = a['more_args'][0]
+    t_start = t_sec(a['more_args'][1])
+    t_end =   t_sec(a['more_args'][2])
+    do_trim(file1,outfile,t_start,t_end)
+  if verb=='speed':
+    recognized = True
+    input_file_required(file1)
+    outfile = a['more_args'][0]
+    speed_factor = float(a['more_args'][1])
+    do_speed_or_pitch(file1,outfile,speed_factor,1.0)
+  if verb=='pitch':
+    recognized = True
+    input_file_required(file1)
+    outfile = a['more_args'][0]
+    pitch_factor = float(a['more_args'][1])
+    do_speed_or_pitch(file1,outfile,1.0,pitch_factor)
+  if verb=='extract_audio':
+    recognized = True
+    input_file_required(file1)
+    outfile = a['more_args'][0]
+    if len(a['more_args'])>=2:
+      kbps = int(a['more_args'][1])
+    else:
+      kbp2 = None
+    if len(a['more_args'])>=3:
+      sample_rate = int(a['more_args'][2])
+    else:
+      sample_rate = None
+    do_extract_audio(file1,outfile,defaults,sample_rate,kbps)
+  if verb=='demetal':
+    recognized = True
+    input_file_required(file1)
+    outfile = a['more_args'][0]
+    do_demetal(file1,outfile,defaults)
+  if verb=='amplify':
+    recognized = True
+    input_file_required(file1)
+    outfile = a['more_args'][0]
+    if len(a['more_args'])>=2:
+      db_raw = a['more_args'][1]
+    else:
+      db_raw = '-'
+    if db_raw=='-':
+      current_loudness = do_loudness(file1) # has side-effect of printing stuff
+      db = -23-current_loudness
+    else:
+      db = float(db_raw)
+    if len(a['more_args'])>=3:
+      low_pass = a['more_args'][2]
+    else:
+      low_pass = defaults['sampling_rate']/2.0 # default to nyquist frequency, i.e., no real filtering; gets automatically lowered later if lower rate
+    print("***************************** amplifying by ",db)
+    do_amplify(file1,outfile,db,low_pass,defaults)
+    if db>18.0:
+      die("too much amplification required, results are likely to be bad")
+      #print("*****************\n\n\ntoo much amplification required, results are likely to be bad\n\n\n******************")
+  if verb=='cat':
+    recognized = True
+    all_file_args = [file1]+a['more_args']
+    output_file = all_file_args[-1]
+    input_files = all_file_args[:-1]  
+    do_cat(input_files,output_file)
+  if verb=='fix_mp3':
+    recognized = True
+    all_file_args = [file1]+a['more_args']
+    do_fix_mp3(all_file_args)
+  if verb=='loudness':
+    recognized = True
+    input_file_required(file1)
+    do_loudness(file1)
+  if not recognized:
+    die(f"unknown verb: {verb}")
+
+def dry_run(x=None):
+  if x!=None:
+    dry_run.value = x
+  return dry_run.value
+
+def do_amplify(in_file,out_file,db,low_pass,defaults):
+  sample_rate = detect_sample_rate(in_file)
+  if low_pass>sample_rate/2.0:
+    low_pass=sample_rate/2.0-1.0
+  result = do_ffmpeg(f"-y -i {in_file} -filter:a 'volume={db}dB,lowpass=f={low_pass}' -c:v copy {out_file}")
+
+def do_demetal(in_file,out_file,defaults):
+  temp = 'vidu_demetal_temp.mp3'
+  # remove frequencies that aren't critical for intelligibility, and that are also where the metallic noise occurs; also, cut low-frequency noise
+  result = do_ffmpeg(f"-y -i {in_file} -filter:a 'equalizer=frequency=5300:width=2700:width_type=h:gain=-60,equalizer=frequency=50:width=50:width_type=h:gain=-60' -c:v copy {temp}")
+  # the result is somewhat attenuated, so boost it back up:
+  current_loudness = do_loudness(temp) # has side-effect of printing stuff
+  db = -23-current_loudness
+  if db>16.0:
+    db=16.0
+  low_pass = defaults['sampling_rate']/2.0 # default to nyquist frequency, i.e., no real filtering; gets automatically lowered later if lower rate
+  do_amplify(temp,out_file,db,low_pass,defaults)
+  rm_f(temp)
+
+def detect_sample_rate(file):
+  output = do_shell(f'mediainfo {file} | grep "Sampling rate"',verbose=False)
+  # gives, e.g., "Sampling rate                            : 16.0 kHz"
+  my_search = re.search('([0-9\.]+)',output)
+  if my_search:
+    rate = my_search.group(1)
+  else:
+    die(f'error in detect_sample_rate on file {file}, output {output} doesn\'t match regex')
+  return float(rate)*1000.0 # convert kHz to Hz
+
+def do_extract_audio(in_file,out_file,defaults,sample_rate,kbps):
+  if sample_rate is None:
+    sample_rate = int(defaults['sampling_rate'])
+  if kbps is None:
+    kbps = 192
+  result = do_ffmpeg(f"-y -i {in_file} -vn -ar {sample_rate*1000} -ac {defaults['channels']} -b:a {kbps}k {out_file}")
+
+def do_trim(in_file,out_file,start,end_time):
+  if end_time<0.0:
+    end_time = get_length(in_file)+end_time
+  print(f'trimming from {start} s to {end_time} s, length={end_time-start} s')
+  result = do_ffmpeg(f'-y -ss {start} -i {in_file} -to {end_time-start} -async 1 {out_file}')
+
+def do_speed_or_pitch(in_file,out_file,speed_factor,pitch_factor):
+  sample_rate = detect_sample_rate(in_file)
+  temp = "vidu_do_speed_and_pitch_temp.mp3"
+  if pitch_factor==1.0:
+    # https://unix.stackexchange.com/a/638281/39248 (my own answer)
+    if speed_factor<0.5:
+      die("due to limitations of ffmpeg, it is not possible to slow audio down by more than a factor of 0.5 in a single pass")
+    print(f'slowing down by a factor of {speed_factor}, while maintaining the sample rate of {sample_rate}')
+    result = do_ffmpeg(f'-y -i {in_file} -filter_complex "[0:a]atempo={speed_factor}[a]" -map "[a]"  {temp}')
+  else:
+    temp2 = "vidu_do_speed_and_pitch_temp_2.mp3"
+    result = do_ffmpeg(f'-y -i {in_file} -filter_complex "[0:a]asetrate=r={sample_rate*pitch_factor}[a]" -map "[a]"  {temp2}')
+    result = do_speed_or_pitch(temp2,temp,speed_factor/pitch_factor,1.0)
+    rm_f(temp2)
+  result = do_ffmpeg(f'-y -i {temp} -ar {sample_rate} {out_file}')
+  rm_f(temp)
+  
+
+def do_length(file):
+  print(get_length(file))
+
+def get_length(file):
+  output = do_shell(f'ffprobe {file} 2>&1 | grep "Duration"',verbose=False) # output of ffprobe is, e.g., Duration: 00:00:03.63, bitrate: 705 kb/s
+  capture = re.search("(\d+):(\d+):(\d+)\.(\d+)",output)
+  if capture:
+    h,m,s,d = capture.group(1,2,3,4)
+    t = float(h)*3600.0+float(m)*60.0+float(s)+float(d)/100.0
+    return t
+  else:
+    die("regex failed")
+
+def do_play(file):
+  temp_file_name = f'vidu_play_temp_{file}.wav'
+  cmd = f'rm -f {temp_file_name} && ffmpeg -i {file} {temp_file_name} 2>&1'
+  do_shell(cmd)
+  cmd = f'aplay {temp_file_name}'  
+  return do_shell(cmd)
+
+def do_loudness(file):
+  result = do_shell(f'ffmpeg -i {file} -af loudnorm=I=-23:print_format=json -f null - 2>&1 | grep input_i')
+  # ... The -23 is required and has to be in range, but has no effect on results.
+  #     Result looks like a JSON fragment: "input_i" : "-50.84",
+  capture = re.search("input_i.*:[^\"]*\"([^\"]+)",result)
+  if capture:
+    db = capture.group(1)
+  else:
+    die("regex failed")
+  print(db)
+  return float(db)
+
+def do_cat(input_files,output_file):
+  if len(input_files)==0:
+    die("no input files supplied")
+  print("concatenating input files: ",input_files)
+  print(f"output file: {output_file}")
+  if os.path.isfile(output_file):
+    die(f"file {output_file} already exists")
+  for f in input_files:
+    if not os.path.isfile(f):
+      die(f"file {f} not found")
+  temp_file_name = 'vidu_cat_files_temp.txt'
+  with open(temp_file_name, 'w') as temp:
+    for f in input_files:
+      print(f"file '{f}'", file = temp)
+  result = do_ffmpeg(f'-y -f concat -safe 0 -i {temp_file_name} -c copy {output_file}')
+  rm_f(temp_file_name)
+  if looks_like_mp3_audio_file(output_file):
+    do_fix_mp3([output_file],verbose=False)
+
+def do_fix_mp3(files,verbose=True):
+  if verbose:
+    print("fixing files: ",files)
+  for f in files:
+    if not os.path.isfile(f):
+      die(f"file {f} not found")
+  temp_file_name = 'vidu_fix_mp3_files_temp.mp3'
+  for f in files:
+    if verbose:
+      print(f"=============== fixing '{f}' ================")
+    diagnostics = do_shell(f"mp3val {f}")
+    if re.search('WARNING',diagnostics):
+      do_shell(f"vbrfix {f} {temp_file_name} && mp3val -f {temp_file_name} && mv {temp_file_name} {f}",verbose=verbose)
+    else:
+      if verbose:
+        print("no warnings found by mp3val, not modifying the file")
+    rm_f('vbrfix.log')
+    rm_f('vbrfix.tmp')
+    rm_f(temp_file_name+'.bak') # I'm unclear on who makes this. In testing, neither vbrfix nor mp3val -f seemed to make this...???
+
+def do_ffmpeg(args):
+  # Input should always start with -y, because otherwise if it asks a y/n question, the script hangs up.
+  cmd = f'ffmpeg {args} 2>&1'
+  return do_shell(cmd)
+
+def input_file_required(f):
+  if f==None:
+    die("no file given")
+  if not os.path.isfile(f):
+    die(f"file {f} not found")
+
+def looks_like_mp3_audio_file(filename):
+  if re.search('\.mp3$',filename):
+    return True
+  else:
+    return False
+
+def do_shell(c,verbose=True):
+  if verbose:
+    print(c)
+  if not dry_run():
+    return subprocess.getoutput(c)
+  else:
+    print("(Didn't do, dry run.)")
+
+def rm_f(filename):
+  # Remove the file. Don't die with an error if it doesn't exist.
+  try:
+    os.remove(filename)
+  except FileNotFoundError:
+    pass
+
+def t_sec(x):
+  # times for ffmpeg can be sexagesimal or seconds; if sexagesimal, doesn't have to have hours or minutes part, and can include decimal fractions
+  # of a second
+  capture = re.search(r"((\d+):)?(\d+):([^:]+)",x)
+  if capture:
+    front,h,m,s = capture.group(1,2,3,4)
+    if front==None:
+      h='0'
+    return float(int(h)*3600.0+int(m)*60.0+float(s))
+  else:
+    return float(x)
+
+def die(message):
+  print(message)
+  os._exit(1)
+
+def get_defaults():
+  if not hasattr(get_defaults,"values"):
+    f = find_defaults_file()
+    if f==None:
+      get_defaults.values = {}
+      print("**** WARNING: no defaults file found, and no defaults supplied from the command line. ****")
+    else:
+      get_defaults.values = json.loads(f.read_text())
+  return get_defaults.values
+
+def find_defaults_file(directory=Path('.').resolve()):
+  # Look for .vidu in current working directory, and if it's not there, go upward through parent directories.
+  # Returns None or a Path object.
+  # Optional input is a string.
+  # https://docs.python.org/3/library/pathlib.html
+  if not (directory.is_dir() and directory.exists()):
+    return None
+  if (directory / '.vidu').exists():
+    return directory / '.vidu'
+  else:
+    parents = directory.parents
+    if len(parents)==0:
+      return None
+    else:
+      x = find_defaults_file(parents[0].resolve())
+      if x==None:
+        return None
+      else:
+        return Path(x)
+
+main()
